@@ -1,288 +1,58 @@
-//! Panic support for the PSP.
-
-// Most of the code here is lifted from `rustc/src/libstd/panicking.rs`. It has
-// been adapted to run on the PSP.
-
-#[cfg(not(feature = "std"))]
-use crate::sys;
-
-#[cfg(feature = "std")]
-use core::{any::Any, mem::ManuallyDrop};
-#[cfg(not(feature = "std"))]
-use core::{
-    any::Any,
-    mem::{self, ManuallyDrop},
-    panic::{Location, PanicInfo, PanicPayload as BoxMeUp},
+use alloc::boxed::Box;
+use core::any::Any;
+use core::ffi::c_void;
+use core::panic::PanicInfo;
+use unwinding::{
+    abi::{UnwindContext, UnwindReasonCode, _Unwind_Backtrace, _Unwind_GetIP},
+    panic::begin_panic,
 };
 
-#[cfg(not(feature = "std"))]
-use core::fmt;
+static mut PANIC_COUNT: usize = 0;
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-};
-
-#[link(name = "unwind", kind = "static")]
-extern "C" {}
-
-#[cfg(not(feature = "std"))]
-fn print_and_die(s: String) -> ! {
-    dprintln!("{}", s);
-
-    unsafe {
-        sys::sceKernelExitDeleteThread(1);
-        core::intrinsics::unreachable()
+fn stack_trace() {
+    struct CallbackData {
+        counter: usize,
     }
+    extern "C" fn callback(unwind_ctx: &UnwindContext<'_>, arg: *mut c_void) -> UnwindReasonCode {
+        let data = unsafe { &mut *(arg as *mut CallbackData) };
+        data.counter += 1;
+        dprintln!(
+            "{:4}:{:#19x} - <unknown>",
+            data.counter,
+            _Unwind_GetIP(unwind_ctx)
+        );
+        UnwindReasonCode::NO_REASON
+    }
+    let mut data = CallbackData { counter: 0 };
+    _Unwind_Backtrace(callback, &mut data as *mut _ as _);
 }
 
-#[cfg(not(feature = "std"))]
+fn do_panic(msg: Box<dyn Any + Send>) -> ! {
+    fn abort() -> ! {
+        unsafe {
+            crate::sys::sceKernelExitDeleteThread(1);
+            core::intrinsics::unreachable()
+        }
+    }
+    unsafe {
+        if PANIC_COUNT >= 1 {
+            stack_trace();
+            dprintln!("thread panicked while processing panic. aborting.");
+            abort();
+        }
+        PANIC_COUNT = 1;
+    }
+    stack_trace();
+
+    let code = begin_panic(Box::new(msg)).0;
+    dprintln!("failed to initiate panic, error {code}");
+    abort();
+}
+
 #[panic_handler]
-#[inline(never)]
-fn panic(info: &PanicInfo) -> ! {
-    panic_impl(info)
-}
+fn panic(info: &PanicInfo<'_>) -> ! {
+    dprintln!("{}", info);
 
-#[inline(always)]
-#[cfg_attr(not(target_os = "psp"), allow(unused))]
-#[cfg(not(feature = "std"))]
-fn panic_impl(info: &PanicInfo) -> ! {
-    struct PanicPayload<'a> {
-        inner: &'a fmt::Arguments<'a>,
-        string: Option<String>,
-    }
-
-    impl<'a> PanicPayload<'a> {
-        fn new(inner: &'a fmt::Arguments<'a>) -> PanicPayload<'a> {
-            PanicPayload {
-                inner,
-                string: None,
-            }
-        }
-
-        fn fill(&mut self) -> &mut String {
-            use fmt::Write;
-            let inner = self.inner;
-            self.string.get_or_insert_with(|| {
-                let mut s = String::new();
-                let _ = s.write_fmt(*inner);
-                s
-            })
-        }
-    }
-
-    unsafe impl<'a> BoxMeUp for PanicPayload<'a> {
-        fn take_box(&mut self) -> *mut (dyn Any + Send) {
-            let contents = mem::take(self.fill());
-            Box::into_raw(Box::new(contents))
-        }
-
-        fn get(&mut self) -> &(dyn Any + Send) {
-            self.fill()
-        }
-    }
-
-    let loc = info.location().unwrap();
-    let msg = info.message().unwrap();
-    rust_panic_with_hook(
-        &mut PanicPayload::new(msg),
-        info.message(),
-        loc,
-        true,
-        false,
-    );
-}
-
-/// Central point for dispatching panics.
-///
-/// Executes the primary logic for a panic, including checking for recursive
-/// panics, panic hooks, and finally dispatching to the panic runtime to either
-/// abort or unwind.
-#[cfg(not(feature = "std"))]
-fn rust_panic_with_hook(
-    payload: &mut dyn BoxMeUp,
-    message: Option<&fmt::Arguments<'_>>,
-    location: &Location<'_>,
-    can_unwind: bool,
-    force_no_backtrace: bool,
-) -> ! {
-    let panics = update_panic_count(1);
-
-    fn die_nested() -> ! {
-        print_and_die("thread panicked while processing panic. aborting.".into());
-    }
-
-    let mut info =
-        PanicInfo::internal_constructor(message, location, can_unwind, force_no_backtrace);
-    info.set_payload(payload.get());
-
-    dprintln!("{}", info.to_string());
-
-    if panics > 1 {
-        // If a thread panics while it's already unwinding then we
-        // have limited options. Currently our preference is to
-        // just abort. In the future we may consider resuming
-        // unwinding or otherwise exiting the thread cleanly.
-        die_nested();
-    }
-
-    rust_panic(payload)
-}
-
-fn update_panic_count(amt: isize) -> usize {
-    // TODO: Make this thread local
-    static mut PANIC_COUNT: usize = 0;
-
-    unsafe {
-        PANIC_COUNT = (PANIC_COUNT as isize + amt) as usize;
-        PANIC_COUNT
-    }
-}
-
-#[allow(improper_ctypes)]
-extern "C" {
-    fn __rust_panic_cleanup(payload: *mut u8) -> *mut (dyn Any + Send + 'static);
-}
-
-#[allow(improper_ctypes)]
-extern "C-unwind" {
-    fn __rust_start_panic(payload: usize) -> u32;
-}
-
-#[inline(never)]
-#[no_mangle]
-#[cfg(not(feature = "std"))]
-fn rust_panic(msg: &mut dyn BoxMeUp) -> ! {
-    let code = unsafe {
-        let obj = msg;
-        panic_unwind::__rust_start_panic(obj as _)
-    };
-
-    print_and_die(alloc::format!("failed to initiate panic, error {}", code))
-}
-
-#[cfg(not(test))]
-#[no_mangle]
-#[cfg(not(feature = "std"))]
-extern "C" fn __rust_drop_panic() -> ! {
-    print_and_die("Rust panics must be rethrown".into());
-}
-
-/// Invoke a closure, capturing the cause of an unwinding panic if one occurs.
-#[inline(never)]
-pub fn catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<dyn Any + Send>> {
-    // This whole function is directly lifted out of rustc. See comments there
-    // for an explanation of how this actually works.
-
-    union Data<F, R> {
-        f: ManuallyDrop<F>,
-        r: ManuallyDrop<R>,
-        p: ManuallyDrop<Box<dyn Any + Send>>,
-    }
-
-    let mut data = Data {
-        f: ManuallyDrop::new(f),
-    };
-
-    let data_ptr = &mut data as *mut _ as *mut u8;
-
-    return unsafe {
-        if core::intrinsics::r#try(do_call::<F, R>, data_ptr, do_catch::<F, R>) == 0 {
-            Ok(ManuallyDrop::into_inner(data.r))
-        } else {
-            Err(ManuallyDrop::into_inner(data.p))
-        }
-    };
-
-    #[cold]
-    unsafe fn cleanup(payload: *mut u8) -> Box<dyn Any + Send + 'static> {
-        let obj = Box::from_raw(__rust_panic_cleanup(payload));
-        update_panic_count(-1);
-        obj
-    }
-
-    #[inline]
-    fn do_call<F: FnOnce() -> R, R>(data: *mut u8) {
-        unsafe {
-            let data = data as *mut Data<F, R>;
-            let data = &mut (*data);
-            let f = ManuallyDrop::take(&mut data.f);
-            data.r = ManuallyDrop::new(f());
-        }
-    }
-
-    #[inline]
-    fn do_catch<F: FnOnce() -> R, R>(data: *mut u8, payload: *mut u8) {
-        unsafe {
-            let data = data as *mut Data<F, R>;
-            let data = &mut (*data);
-            let obj = cleanup(payload);
-            data.p = ManuallyDrop::new(obj);
-        }
-    }
-}
-
-// TODO: EH personality was moved from the panic_unwind crate to std in
-// https://github.com/rust-lang/rust/pull/92845. This no-op implementation
-// should be replaced with the version from std when using no_std.
-#[cfg(not(feature = "std"))]
-#[lang = "eh_personality"]
-unsafe extern "C" fn rust_eh_personality() {}
-
-/// These symbols and functions should not actually be used. `libunwind`,
-/// however, requires them to be present so that it can link.
-// TODO: Patch these out of libunwind instead.
-#[cfg(all(target_os = "psp", not(feature = "stub-only")))]
-mod libunwind_shims {
-    #[no_mangle]
-    unsafe extern "C" fn fprintf(_stream: *const u8, _format: *const u8, ...) -> isize {
-        -1
-    }
-
-    #[no_mangle]
-    unsafe extern "C" fn fflush(_stream: *const u8) -> i32 {
-        -1
-    }
-
-    #[no_mangle]
-    #[allow(deprecated)]
-    unsafe extern "C" fn abort() {
-        loop {
-            core::arch::asm!("");
-        }
-    }
-
-    #[no_mangle]
-    unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
-        use alloc::alloc::{alloc, Layout};
-
-        let size = size + 4;
-
-        let data = alloc(Layout::from_size_align_unchecked(size, 4));
-        *(data as *mut usize) = size;
-
-        data.offset(4)
-    }
-
-    #[no_mangle]
-    unsafe extern "C" fn free(data: *mut u8) {
-        use alloc::alloc::{dealloc, Layout};
-
-        let base = data.sub(4);
-        let size = *(base as *mut usize);
-
-        dealloc(base, Layout::from_size_align_unchecked(size, 4));
-    }
-
-    #[no_mangle]
-    unsafe extern "C" fn getenv(_name: *const u8) -> *const u8 {
-        core::ptr::null()
-    }
-
-    #[no_mangle]
-    unsafe extern "C" fn __assert_func(_: *const u8, _: i32, _: *const u8, _: *const u8) {}
-
-    #[no_mangle]
-    static _impure_ptr: [usize; 0] = [];
+    struct NoPayload;
+    do_panic(Box::new(NoPayload))
 }

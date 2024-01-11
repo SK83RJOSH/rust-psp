@@ -9,9 +9,6 @@
     c_variadic,
     lang_items
 )]
-// For unwinding support
-#![feature(std_internals, panic_info_message, panic_internals, c_unwind)]
-#![cfg_attr(not(feature = "stub-only"), feature(panic_unwind))]
 #![cfg_attr(feature = "std", feature(psp_std))]
 // For the `const_generics` feature.
 #![allow(incomplete_features)]
@@ -22,7 +19,7 @@ extern crate paste;
 #[cfg(not(feature = "stub-only"))]
 extern crate alloc;
 #[cfg(not(feature = "stub-only"))]
-extern crate panic_unwind;
+extern crate unwinding;
 
 #[macro_use]
 #[doc(hidden)]
@@ -41,8 +38,9 @@ pub mod vram_alloc;
 
 #[cfg(not(feature = "stub-only"))]
 mod alloc_impl;
+
 #[cfg(not(feature = "stub-only"))]
-pub mod panic;
+mod panic;
 
 #[cfg(not(feature = "stub-only"))]
 mod screenshot;
@@ -83,7 +81,35 @@ extern "C" fn __rust_foreign_exception() -> ! {
 pub use std::panic::catch_unwind;
 
 #[cfg(all(not(feature = "std"), not(feature = "stub-only")))]
-pub use panic::catch_unwind;
+pub use unwinding::panic::catch_unwind;
+
+#[cfg(all(not(feature = "std"), not(feature = "stub-only")))]
+pub mod eh_unwinding {
+    use unwinding::custom_eh_frame_finder::*;
+
+    extern "C" {
+        static __text: u8;
+        static __eh_frame_hdr: u8;
+    }
+
+    pub struct EhFrameFinderImpl;
+
+    unsafe impl EhFrameFinder for EhFrameFinderImpl {
+        fn find(&self, _pc: usize) -> Option<FrameInfo> {
+            unsafe {
+                Some(FrameInfo {
+                    text_base: Some(&__text as *const _ as usize),
+                    kind: FrameInfoKind::EhFrameHdr(&__eh_frame_hdr as *const _ as usize),
+                })
+            }
+        }
+    }
+
+    pub fn set_eh_frame_finder() -> Result<(), SetCustomEhFrameFinderError> {
+        static EH_FRAME_FINDER: &(dyn EhFrameFinder + Sync) = &EhFrameFinderImpl;
+        set_custom_eh_frame_finder(EH_FRAME_FINDER)
+    }
+}
 
 #[cfg(feature = "embedded-graphics")]
 pub mod embedded_graphics;
@@ -164,7 +190,9 @@ macro_rules! _start {
             unsafe { init_cwd($argv as *mut u8) };
         }
 
-        // TODO: Maybe print any error to debug screen?
+        #[cfg(all(not(feature = "std"), not(feature = "stub-only")))]
+        $crate::eh_unwinding::set_eh_frame_finder();
+
         let _ = $crate::catch_unwind($psp_main);
 
         0
